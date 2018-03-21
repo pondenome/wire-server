@@ -5,82 +5,99 @@
 
 module Journal where
 
-import Cassandra as C
-import Control.Concurrent.Async.Lifted.Safe (mapConcurrently)
+import Cassandra as C hiding (pageSize)
+import Control.Concurrent.Async.Lifted.Safe (mapConcurrently_)
 import Control.Lens
 import Control.Monad.Except
 import Data.Id
 import Data.ByteString.Conversion
 import Data.Monoid ((<>))
-import Data.Int
-import Data.Maybe (fromMaybe)
-import Proto.TeamEvents
-import Galley.Types.Teams (TeamCreationTime (..), tcTime)
+import Data.Text (Text)
+import Galley.Data ()
+import Galley.Types.Teams
 import Galley.Types.Teams.Intra
 import System.Logger (Logger)
 
 import qualified System.Logger        as Log
-import qualified Galley.Data          as Data
-import qualified Galley.Intra.Journal as Journal
-import qualified Galley.Aws           as Aws
 
-
-runCommand :: Logger -> Aws.Env -> ClientState -> Maybe TeamId -> IO ()
-runCommand l env c start = void $ C.runClient c $ do
+runCommand :: Logger -> ClientState -> ClientState -> Bool -> Maybe (UserId, TeamId) -> IO ()
+runCommand l galley brig performUpdates start = void $ C.runClient galley $ do
     page <- case start of
-        Just st -> retry x5 $ paginate teamSelectFrom (paramsP Quorum (Identity st) 100)
-        Nothing -> retry x5 $ paginate teamSelect' (paramsP Quorum () 100)
+        Just (u,_t) -> retry x5 $ paginate teamUserSelectFrom (paramsP Quorum (Identity u) pageSize)
+        Nothing     -> retry x5 $ paginate teamUserSelect (paramsP Quorum () pageSize)
     scan 0 page
-
   where
-    scan :: Int -> Page Row -> C.Client ()
+    pageSize = 16
+
+    scan :: Int -> Page TeamUser -> C.Client ()
     scan acc page = do
-        let boundTeams = filterBinding (result page)
-        void $ mapConcurrently journal boundTeams
-        let count = acc + Prelude.length boundTeams
-        Log.info l . Log.msg $ Log.val ("Processed " <> toByteString' count <> " bound teams so far")
+        let res   = result page
+        let count = acc + Prelude.length res
+        -- Just log a pointer for ease of repetition in case of failures
+        case res of
+            []        -> return ()
+            ((u,t):_) -> Log.info l . Log.msg $ Log.val ("Current pointer at user: " <> toByteString' u <> " team: " <> toByteString' t)
+        -- Process `pageSize` users in parallel
+        mapConcurrently_ processUser res
+        Log.info l . Log.msg $ Log.val ("Processed " <> toByteString' count <> " team members so far")
         when (hasMore page) $
             retry x5 (liftClient (nextPage page)) >>= scan count
 
-    journal :: (TeamId, Maybe TeamStatus, Maybe TeamCreationTime) -> C.Client ()
-    journal (tid, s, time) = C.runClient c $ case s of
-          Just Active        -> journalTeamActivate tid time
-          Just PendingDelete -> journalTeamDelete tid
-          Just Deleted       -> journalTeamDelete tid
-          Just Suspended     -> journalTeamSuspend tid
-          Just PendingActive -> return ()
-          -- Nothing addresses teams that are "pre status"
-          Nothing            -> journalTeamActivate tid time
+    processUser :: TeamUser -> C.Client ()
+    processUser (u, t) = do
+        team <- retry x5 $ query1 teamSelect $ params Quorum (Identity t)
+        -- Is this user part of a binding team?
+        case team of
+            Just (_tid, binding, deleted, name, _status)
+                | binding == Just Binding &&   -- We look only at binding teams
+                  deleted == False &&          -- Don't update deleted users
+                  name `notElem` teamsToIgnore -- We can avoid updating most users by checking the team name
+                                               -> handleBindingTeamUser (u, t)
+                | otherwise                    -> Log.info l . Log.msg $ Log.val ("Ignoring user: " <> toByteString' u)
+            Nothing -> Log.warn l . Log.msg $ Log.val ("No such team: " <> toByteString' t)
 
-    journalTeamDelete :: TeamId -> C.Client ()
-    journalTeamDelete tid = publish tid TeamEvent'TEAM_DELETE Nothing Nothing
+    handleBindingTeamUser :: TeamUser -> C.Client ()
+    handleBindingTeamUser (u, t) = void $ C.runClient brig $ do
+        -- Check the existing user
+        user <- retry x5 $ query1 userSelect $ params Quorum (Identity u)
+        -- Unless the look actually returns a user (it always should!), don't
+        -- update as that would cause a "broken" insert
+        case user of
+            Just (_, Just _,  _) -> Log.info l . Log.msg $ Log.val ("User: " <> toByteString' u <> " already has team: " <> toByteString' t)
+            -- ^ These users already have a team, don't update again
+            Just (_, Nothing, _) | performUpdates -> do
+                                     retry x5 $ write userUpdate $ params Quorum (t, u)
+                                     Log.info l . Log.msg $ Log.val ("Updating user: " <> toByteString' u <> " with team: " <> toByteString' t)
+                                 | otherwise      ->
+                                     Log.info l . Log.msg $ Log.val ("Should update user: " <> toByteString' u <> " with team: " <> toByteString' t)
+            -- ^ There is a user who is part of a binding team, but no team is set in the user profile
+            Nothing  -> Log.warn l . Log.msg $ Log.val ("User: " <> toByteString' u <> " does not exist??")
 
-    journalTeamSuspend :: TeamId -> C.Client ()
-    journalTeamSuspend tid = publish tid TeamEvent'TEAM_SUSPEND Nothing Nothing
-
-    journalTeamActivate :: TeamId -> Maybe TeamCreationTime -> C.Client ()
-    journalTeamActivate tid time = do
-        mems <- Data.teamMembers tid
-        let dat = Journal.evData mems Nothing
-        publish tid TeamEvent'TEAM_ACTIVATE time (Just dat)
-
-    publish :: TeamId -> TeamEvent'EventType -> Maybe TeamCreationTime -> Maybe TeamEvent'EventData -> C.Client ()
-    publish tid typ time dat = do
-        -- writetime is in microseconds in cassandra 3.11
-        creationTimeSeconds <- maybe Journal.nowInt (return . (`div` 1000000) . view tcTime) time
-        let event = TeamEvent typ (Journal.bytes tid) creationTimeSeconds dat
-        Aws.execute env (Aws.enqueue event)
+    -- These teams were/are spam related, we should permanently deleted them
+    teamsToIgnore :: [Text]
+    teamsToIgnore = [ "dsfewwfww" 
+                    , "ВАМ 57$, ЖМИТЕ НА ССЫЛКУ » http://dengibest.ru#-ВЫВЕСТИ-БОНУС"
+                    ]
 
 -- CQL queries
-teamSelect' :: PrepQuery R () Row
-teamSelect' = "SELECT team, binding, status, writetime(binding) FROM team"
+teamUserSelect :: PrepQuery R () TeamUser
+teamUserSelect = "SELECT user, team FROM user_team"
 
-teamSelectFrom :: PrepQuery R (Identity TeamId) Row
-teamSelectFrom = "SELECT team, binding, status, writetime(binding) FROM team WHERE token(team) > token(?)"
+teamUserSelectFrom :: PrepQuery R (Identity UserId) TeamUser
+teamUserSelectFrom = "SELECT user, team FROM user_team WHERE token(user) > token(?)"
+
+teamSelect :: PrepQuery R (Identity TeamId) TeamDB
+teamSelect = "SELECT team, binding, deleted, name, status FROM team WHERE team = ?"
+
+userSelect :: PrepQuery R (Identity UserId) UserDB
+userSelect = "SELECT id, team, activated FROM user WHERE id = ?"
+
+userUpdate :: PrepQuery W (TeamId, UserId) ()
+userUpdate = "UPDATE user SET team = ? WHERE id = ?"
 
 -- Utils
 
-type Row = (TeamId, Maybe Bool, Maybe TeamStatus, Maybe Int64)
-
-filterBinding :: [Row] -> [(TeamId, Maybe TeamStatus, Maybe TeamCreationTime)]
-filterBinding = map (\(t, _, st, tim) -> (t, st, TeamCreationTime <$> tim)) . filter (\(_, b, _, _) -> fromMaybe False b)
+type UserDB   = (UserId, Maybe TeamId, Bool)
+type TeamDB   = (TeamId, Maybe TeamBinding, Bool, Text, Maybe TeamStatus)
+type TeamUser = (UserId, TeamId)
+type UserRow  = (UserId, Bool)

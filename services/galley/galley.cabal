@@ -246,7 +246,9 @@ executable galley-journaler
     build-depends:
         amazonka
       , amazonka-sqs
+      , attoparsec
       , base
+      , brig-types
       , galley
       , HsOpenSSL
       , optparse-applicative
